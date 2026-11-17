@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import os
@@ -24,6 +23,11 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # SETTINGS
 CHECK_INTERVAL = 5       # GitHub runs every 5 minutes
 HEARTBEAT_INTERVAL = 15 * 60  # 15 minutes in seconds
+
+# Runs start a little earlier or later than every 5 minutes, so a run that
+# is only a minute or two short of 15 minutes still counts as "due".
+# Without this, a heartbeat can slip to the next run (about 20 minutes).
+HEARTBEAT_TOLERANCE = 2 * 60  # 2 minutes in seconds
 
 STATE_FILE = Path("live_state.json")
 
@@ -210,7 +214,7 @@ async def main():
     if (
         offline_accounts
         and now - state["last_offline_heartbeat"]
-        >= HEARTBEAT_INTERVAL
+        >= HEARTBEAT_INTERVAL - HEARTBEAT_TOLERANCE
     ):
 
         status_lines = []
