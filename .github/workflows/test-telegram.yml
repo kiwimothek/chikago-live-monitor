@@ -2,6 +2,17 @@ name: Test Telegram Notification
 
 on:
   workflow_dispatch:
+    inputs:
+      message:
+        description: "Message text (type \\n for a new line)"
+        required: true
+        type: string
+        default: "✅ TEST NOTIFICATION\\n\\nYour TikTok LIVE monitor Telegram notifications are working."
+      silent:
+        description: "Send silently (no sound)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   send-test:
@@ -11,10 +22,17 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Passed through env vars (not pasted into the script) so special
+          # characters in the text cannot break or inject into the command.
+          MESSAGE: ${{ inputs.message }}
+          SILENT: ${{ inputs.silent }}
         run: |
+          # The input box is one line, so turn a typed \n into a real line break
+          TEXT="${MESSAGE//\\n/$'\n'}"
+
           curl --fail-with-body --silent --show-error \
             --request POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode $'text=✅ TEST NOTIFICATION\n\nYour TikTok LIVE monitor Telegram notifications are working.' \
-            --data-urlencode "disable_notification=false"
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "disable_notification=${SILENT}"

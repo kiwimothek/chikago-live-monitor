@@ -32,6 +32,13 @@ HEARTBEAT_INTERVAL = 12 * 60 * 60  # 12 hours in seconds
 # Without this, a heartbeat can slip to the next run.
 HEARTBEAT_TOLERANCE = 2 * 60  # 2 minutes in seconds
 
+# A LIVE only counts as ended after the account looks offline on this many
+# checks in a row (about 4.7 minutes apart, so 3 checks is roughly 10
+# minutes). This stops a short TikTok glitch from splitting one live into
+# two. The recorded end time is the FIRST offline check, so the waiting
+# does not inflate the duration. Starts are announced immediately.
+OFFLINE_CONFIRM_CHECKS = 3
+
 STATE_FILE = Path("live_state.json")
 
 # One row per finished LIVE. Opens in Excel / Google Sheets, and GitHub
@@ -167,7 +174,9 @@ def load_state():
         return {
             "accounts": {},
             "last_offline_heartbeat": 0,
-            "live_since": {}
+            "live_since": {},
+            "offline_checks": {},
+            "offline_since": {}
         }
 
     with open(STATE_FILE, "r") as file:
@@ -193,6 +202,18 @@ def load_state():
         "live_since": {
             key: float(value)
             for key, value in data.get("live_since", {}).items()
+            if isinstance(value, (int, float))
+        },
+        # Consecutive offline checks for an account that was LIVE, and when
+        # the first of them happened (see OFFLINE_CONFIRM_CHECKS)
+        "offline_checks": {
+            key: int(value)
+            for key, value in data.get("offline_checks", {}).items()
+            if isinstance(value, (int, float))
+        },
+        "offline_since": {
+            key: float(value)
+            for key, value in data.get("offline_since", {}).items()
             if isinstance(value, (int, float))
         }
     }
@@ -222,6 +243,11 @@ async def main():
     state = load_state()
     previous_status = state["accounts"]
     live_since = state["live_since"]
+    offline_checks = state["offline_checks"]
+    offline_since = state["offline_since"]
+
+    # Accounts that look offline but are still inside the confirmation wait
+    pending = set()
 
     updated_status = previous_status.copy()
     current_status = {}
@@ -253,6 +279,33 @@ async def main():
             if is_live and username not in live_since:
                 live_since[username] = time.time()
 
+            # Back online (or never went offline): cancel any stop countdown
+            if is_live:
+                offline_checks.pop(username, None)
+                offline_since.pop(username, None)
+
+            # An account that was LIVE now looks offline: count it, and only
+            # confirm the stop after OFFLINE_CONFIRM_CHECKS checks in a row.
+            confirmed_stop = False
+
+            if not is_live and was_live is True:
+
+                offline_since.setdefault(username, time.time())
+                offline_checks[username] = (
+                    offline_checks.get(username, 0) + 1
+                )
+
+                if offline_checks[username] >= OFFLINE_CONFIRM_CHECKS:
+                    confirmed_stop = True
+                else:
+                    pending.add(username)
+                    print(
+                        f"@{username}: offline check "
+                        f"{offline_checks[username]}/"
+                        f"{OFFLINE_CONFIRM_CHECKS}, "
+                        "waiting before ending the LIVE"
+                    )
+
             # ----------------------------------
             # ACCOUNT STARTED LIVE
             # ----------------------------------
@@ -276,10 +329,12 @@ async def main():
             # ACCOUNT STOPPED LIVE
             # ----------------------------------
 
-            elif not is_live and was_live is True:
+            elif confirmed_stop:
 
                 start = live_since.get(username)
-                end = time.time()
+
+                # The LIVE ended when it first looked offline
+                end = offline_since.get(username, time.time())
 
                 lines = [f"⚫ @{username} HAS STOPPED LIVE!", ""]
 
@@ -316,9 +371,16 @@ async def main():
                         )
 
                     live_since.pop(username, None)
+                    offline_checks.pop(username, None)
+                    offline_since.pop(username, None)
 
                 except Exception as error:
                     print(f"Telegram notification failed: {error}")
+
+            elif username in pending:
+
+                # Still counted as LIVE until the stop is confirmed
+                pass
 
             else:
 
@@ -326,6 +388,8 @@ async def main():
 
                 if not is_live:
                     live_since.pop(username, None)
+                    offline_checks.pop(username, None)
+                    offline_since.pop(username, None)
 
         except Exception as error:
 
@@ -340,10 +404,11 @@ async def main():
 
     now = time.time()
 
+    # An account still inside the confirmation wait counts as LIVE here too
     offline_accounts = [
         username
         for username, status in current_status.items()
-        if status is False
+        if status is False and username not in pending
     ]
 
     if (
@@ -359,7 +424,7 @@ async def main():
             if username in current_status:
                 status = (
                     "🔴 LIVE"
-                    if current_status[username]
+                    if current_status[username] or username in pending
                     else "⚫ OFFLINE"
                 )
             else:
@@ -391,6 +456,8 @@ async def main():
 
     state["accounts"] = updated_status
     state["live_since"] = live_since
+    state["offline_checks"] = offline_checks
+    state["offline_since"] = offline_since
 
     save_state(state)
 
