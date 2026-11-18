@@ -52,10 +52,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add live_state.json
+          git add live_state.json live_history.csv
 
           git diff --cached --quiet || (
             git commit -m "Update LIVE monitoring status"
+            git pull --rebase --autostash -q origin main
             git push
           )
 
