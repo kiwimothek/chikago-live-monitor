@@ -22,7 +22,7 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # SETTINGS
 CHECK_INTERVAL = 5       # GitHub runs every 5 minutes
-HEARTBEAT_INTERVAL = 15 * 60  # 15 minutes in seconds
+HEARTBEAT_INTERVAL = 60 * 60  # 15 minutes in seconds
 
 # Runs start a little earlier or later than every 5 minutes, so a run that
 # is only a minute or two short of 15 minutes still counts as "due".
@@ -235,7 +235,7 @@ async def main():
         message = (
             "🟢 TIKTOK BOT IS ALIVE\n\n"
             + "\n".join(status_lines)
-            + "\n\nNext heartbeat in approximately 15 minutes."
+            + "\n\nNext heartbeat in approximately 1 hour."
         )
 
         try:
