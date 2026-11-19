@@ -62,10 +62,13 @@ jobs:
 
   # Starts the next run about 5 minutes after this one started.
   # Runs even if the monitor job failed, so one bad check cannot stop the loop.
-  # Cron-triggered runs skip this job; they are one-off checks.
+  # It also runs after cron-triggered runs. GitHub keeps only the newest
+  # waiting run per concurrency group, so a cron run can replace the run
+  # this loop queued; if cron runs did not restart the loop, it would die
+  # there (this is exactly what happened on 18 Nov at 23:11 UTC).
   next:
     needs: monitor
-    if: ${{ always() && github.event_name != 'schedule' }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
 
@@ -85,4 +88,13 @@ jobs:
       - name: Start the next run
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run monitor.yml --repo "$GITHUB_REPOSITORY" --ref main
+        run: |
+          # Retry a few times so one failed API call cannot end the loop
+          for attempt in 1 2 3; do
+            if gh workflow run monitor.yml --repo "$GITHUB_REPOSITORY" --ref main; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed, retrying..."
+            sleep 15
+          done
+          exit 1
