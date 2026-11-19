@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import csv
+import hashlib
 import json
 import os
 import time
@@ -9,6 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from TikTokLive import TikTokLiveClient
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:
+    # Followers are switched off if the library is missing; the monitor
+    # itself keeps working and only messages the owner.
+    Fernet = None
+    InvalidToken = Exception
 
 
 # ==========================================
@@ -22,6 +32,11 @@ USERNAME_2 = "ventsislav.angelo06"
 # TELEGRAM CREDENTIALS (GITHUB SECRETS)
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+# OPTIONAL: lets other people send /follow to get the same alerts. It is the
+# password that encrypts the follower list (subscribers.enc), because this
+# repository is public. Without it the bot only messages the owner.
+SUBSCRIBERS_KEY = os.environ.get("SUBSCRIBERS_KEY", "").strip()
 
 # SETTINGS
 CHECK_INTERVAL = 5       # GitHub runs every 5 minutes
@@ -38,6 +53,10 @@ HEARTBEAT_TOLERANCE = 2 * 60  # 2 minutes in seconds
 # two. The recorded end time is the FIRST offline check, so the waiting
 # does not inflate the duration. Starts are announced immediately.
 OFFLINE_CONFIRM_CHECKS = 3
+
+# Followers who sent /follow (encrypted list of Telegram chat IDs)
+SUBSCRIBERS_FILE = Path("subscribers.enc")
+MAX_SUBSCRIBERS = 20
 
 STATE_FILE = Path("live_state.json")
 
@@ -100,14 +119,22 @@ def format_duration(seconds):
 # TELEGRAM
 # ==========================================
 
-def send_telegram(message, silent=False):
+def describe(error):
 
+    # Network errors from requests contain the full URL, and the URL
+    # contains the bot token. Never let it reach the (public) logs.
+    return str(error).replace(BOT_TOKEN, "***")
+
+
+def send_telegram(message, silent=False, chat_id=None):
+
+    # chat_id=None means the owner (TELEGRAM_CHAT_ID)
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     response = requests.post(
         url,
         data={
-            "chat_id": CHAT_ID,
+            "chat_id": CHAT_ID if chat_id is None else chat_id,
             "text": message,
             "disable_notification": silent
         },
@@ -120,6 +147,203 @@ def send_telegram(message, silent=False):
 
     if not result.get("ok"):
         raise RuntimeError(f"Telegram error: {result}")
+
+
+# ==========================================
+# FOLLOWERS (/follow, /unfollow)
+# ==========================================
+#
+# Anyone can message the bot /follow. Their chat ID is read from Telegram
+# (getUpdates), stored ENCRYPTED in subscribers.enc, and from then on they
+# get the same LIVE / STOPPED alerts as the owner. The TikTok check still
+# happens only once per run. Chat IDs are never printed: the logs of a
+# public repository are public.
+
+HELP_TEXT = (
+    "👋 This bot sends an alert when the monitored TikTok accounts go "
+    "LIVE or stop being LIVE.\n\n"
+    "/follow - get the alerts\n"
+    "/unfollow - stop getting them\n\n"
+    "Replies can take up to 5 minutes."
+)
+
+FOLLOW_TEXT = (
+    "✅ You are now following. You will get an alert when a monitored "
+    "account goes LIVE or stops (checked about every 5 minutes).\n\n"
+    "Your chat ID is stored encrypted. Send /unfollow to stop."
+)
+
+
+def make_fernet():
+
+    if not SUBSCRIBERS_KEY or Fernet is None:
+        return None
+
+    # Slow key derivation, because the encrypted file is public and
+    # anyone could try to guess the password offline.
+    raw = hashlib.pbkdf2_hmac(
+        "sha256",
+        SUBSCRIBERS_KEY.encode(),
+        b"tiktok-live-monitor/subscribers",
+        200_000
+    )
+
+    return Fernet(base64.urlsafe_b64encode(raw))
+
+
+def load_subscribers(fernet):
+
+    # Raises if the file cannot be read, so a wrong key can never lead
+    # to the real list being overwritten with an empty one.
+
+    if not SUBSCRIBERS_FILE.exists():
+        return []
+
+    try:
+        data = fernet.decrypt(SUBSCRIBERS_FILE.read_bytes())
+        return [int(chat_id) for chat_id in json.loads(data)]
+
+    except (InvalidToken, ValueError, TypeError):
+        raise RuntimeError(
+            "could not decrypt subscribers.enc (wrong SUBSCRIBERS_KEY?)"
+        ) from None
+
+
+def save_subscribers(fernet, chat_ids):
+
+    SUBSCRIBERS_FILE.write_bytes(
+        fernet.encrypt(json.dumps(sorted(chat_ids)).encode())
+    )
+
+
+def broadcast(message, subs):
+
+    # The owner is sent first. If that fails the error is raised, so the
+    # caller keeps its old state and tries again on the next run.
+    send_telegram(message)
+
+    sent = 0
+    failed = 0
+
+    for chat_id in list(subs["ids"]):
+
+        try:
+            send_telegram(message, chat_id=chat_id)
+            sent += 1
+
+        except requests.HTTPError as error:
+            failed += 1
+
+            # 403 = the follower blocked the bot or deleted the chat
+            if (
+                error.response is not None
+                and error.response.status_code == 403
+            ):
+                subs["ids"].remove(chat_id)
+                subs["dirty"] = True
+
+        except Exception:
+            failed += 1
+
+    if sent or failed:
+        print(f"Followers notified: {sent}, failed: {failed}")
+
+
+def process_commands(state, subs):
+
+    response = requests.get(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+        params={
+            "offset": state["update_offset"],
+            "timeout": 0,
+            "allowed_updates": json.dumps(["message"])
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram getUpdates returned an error")
+
+    handled = 0
+
+    for update in result["result"]:
+
+        # Tell Telegram this update has been handled
+        state["update_offset"] = max(
+            state["update_offset"], update["update_id"] + 1
+        )
+
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        text = (message.get("text") or "").strip()
+
+        # Private chats only, and only /commands
+        if chat.get("type") != "private" or not text.startswith("/"):
+            continue
+
+        chat_id = chat.get("id")
+        command = text.split()[0].split("@")[0].lower()
+        is_owner = str(chat_id) == str(CHAT_ID)
+
+        reply = None
+        owner_note = None
+
+        if command in ("/start", "/help"):
+            reply = HELP_TEXT
+
+        elif command == "/follow":
+
+            if is_owner:
+                reply = "You already get every alert, you own this bot. 🙂"
+
+            elif chat_id in subs["ids"]:
+                reply = "You are already following. Send /unfollow to stop."
+
+            elif len(subs["ids"]) >= MAX_SUBSCRIBERS:
+                reply = "Sorry, the follower list is full."
+
+            else:
+                subs["ids"].append(chat_id)
+                subs["dirty"] = True
+                reply = FOLLOW_TEXT
+                owner_note = (
+                    f"👤 New follower. Followers: {len(subs['ids'])}"
+                )
+
+        elif command == "/unfollow":
+
+            if chat_id in subs["ids"]:
+                subs["ids"].remove(chat_id)
+                subs["dirty"] = True
+                reply = "✅ You stopped following. Send /follow to return."
+                owner_note = (
+                    f"👤 A follower left. Followers: {len(subs['ids'])}"
+                )
+
+            else:
+                reply = "You were not following."
+
+        if reply is None:
+            continue
+
+        handled += 1
+
+        try:
+            send_telegram(reply, chat_id=chat_id)
+        except Exception:
+            print("Could not reply to a command")
+
+        if owner_note:
+            try:
+                send_telegram(owner_note, silent=True)
+            except Exception:
+                print("Could not notify the owner about a follower change")
+
+    print(f"Telegram commands handled: {handled}")
 
 
 # ==========================================
@@ -176,7 +400,8 @@ def load_state():
             "last_offline_heartbeat": 0,
             "live_since": {},
             "offline_checks": {},
-            "offline_since": {}
+            "offline_since": {},
+            "update_offset": 0
         }
 
     with open(STATE_FILE, "r") as file:
@@ -215,7 +440,9 @@ def load_state():
             key: float(value)
             for key, value in data.get("offline_since", {}).items()
             if isinstance(value, (int, float))
-        }
+        },
+        # Next Telegram update to read (see process_commands)
+        "update_offset": int(data.get("update_offset", 0))
     }
 
 
@@ -257,6 +484,24 @@ async def main():
     print("=" * 40)
     print("TIKTOK LIVE MONITOR")
     print("=" * 40)
+
+    # Followers: read new /follow and /unfollow commands first, so a new
+    # follower can already get an alert from this very run.
+    fernet = make_fernet()
+
+    subs = {"ids": [], "dirty": False, "ok": False}
+
+    if fernet is None:
+        print("Followers off (no SUBSCRIBERS_KEY): alerts go to the owner only.")
+    else:
+        try:
+            subs["ids"] = load_subscribers(fernet)
+            subs["ok"] = True
+            print(f"Followers: {len(subs['ids'])}")
+            process_commands(state, subs)
+
+        except Exception as error:
+            print(f"Follower commands skipped: {describe(error)}")
 
     # Check both accounts
     for username in usernames:
@@ -318,12 +563,12 @@ async def main():
                 )
 
                 try:
-                    send_telegram(message)
+                    broadcast(message, subs)
                     print(f"LIVE notification sent: @{username}")
                     updated_status[username] = True
 
                 except Exception as error:
-                    print(f"Telegram notification failed: {error}")
+                    print(f"Telegram notification failed: {describe(error)}")
 
             # ----------------------------------
             # ACCOUNT STOPPED LIVE
@@ -351,7 +596,7 @@ async def main():
                 message = "\n".join(lines)
 
                 try:
-                    send_telegram(message)
+                    broadcast(message, subs)
                     print(f"OFFLINE notification sent: @{username}")
                     updated_status[username] = False
 
@@ -375,7 +620,7 @@ async def main():
                     offline_since.pop(username, None)
 
                 except Exception as error:
-                    print(f"Telegram notification failed: {error}")
+                    print(f"Telegram notification failed: {describe(error)}")
 
             elif username in pending:
 
@@ -448,7 +693,7 @@ async def main():
 
         except Exception as error:
 
-            print(f"Heartbeat failed: {error}")
+            print(f"Heartbeat failed: {describe(error)}")
 
     # ==========================================
     # SAVE EVERYTHING
@@ -458,6 +703,15 @@ async def main():
     state["live_since"] = live_since
     state["offline_checks"] = offline_checks
     state["offline_since"] = offline_since
+
+    # Only rewrite the follower file when it really changed (and only if it
+    # was read correctly), so the public repo shows no needless changes.
+    if fernet is not None and subs["ok"] and subs["dirty"]:
+        try:
+            save_subscribers(fernet, subs["ids"])
+            print("Follower list updated.")
+        except Exception as error:
+            print(f"Could not save followers: {error}")
 
     save_state(state)
 
