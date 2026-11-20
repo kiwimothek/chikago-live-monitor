@@ -8,7 +8,13 @@
         "user4525838653694": 1795201937.3881586,
         "ventsislav.angelo06": 1795201938.9162652
     },
-    "offline_checks": {},
-    "offline_since": {},
+    "offline_checks": {
+        "user4525838653694": 1,
+        "ventsislav.angelo06": 1
+    },
+    "offline_since": {
+        "user4525838653694": 1795205838.375137,
+        "ventsislav.angelo06": 1795205838.9244368
+    },
     "update_offset": 0
 }
