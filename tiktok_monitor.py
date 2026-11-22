@@ -159,14 +159,6 @@ def send_telegram(message, silent=False, chat_id=None):
 # happens only once per run. Chat IDs are never printed: the logs of a
 # public repository are public.
 
-HELP_TEXT = (
-    "👋 This bot sends an alert when the monitored TikTok accounts go "
-    "LIVE or stop being LIVE.\n\n"
-    "/follow - get the alerts\n"
-    "/unfollow - stop getting them\n\n"
-    "Replies can take up to 5 minutes."
-)
-
 FOLLOW_TEXT = (
     "✅ You are now following. You will get an alert when a monitored "
     "account goes LIVE or stops (checked about every 5 minutes).\n\n"
@@ -249,6 +241,227 @@ def broadcast(message, subs):
         print(f"Followers notified: {sent}, failed: {failed}")
 
 
+# ------------------------------------------
+# Command handlers. Each one gets a small
+# "ctx" dict and returns (reply, owner_note):
+# the reply goes to whoever sent the command,
+# the owner_note (or None) is sent silently
+# to the owner.
+# ------------------------------------------
+
+def monitored_usernames():
+
+    usernames = [
+        USERNAME_1.strip().lstrip("@"),
+        USERNAME_2.strip().lstrip("@")
+    ]
+
+    return list(dict.fromkeys(
+        username for username in usernames if username
+    ))
+
+
+def cmd_help(ctx):
+
+    lines = [
+        "👋 This bot sends an alert when the monitored TikTok accounts "
+        "go LIVE or stop being LIVE.",
+        "",
+        "Commands:",
+    ]
+
+    for name, description, owner_only, _ in COMMANDS:
+
+        if owner_only and not ctx["is_owner"]:
+            continue
+
+        lines.append(f"/{name} - {description}")
+
+    lines += ["", "Replies can take up to 5 minutes."]
+
+    return "\n".join(lines), None
+
+
+def cmd_status(ctx):
+
+    state = ctx["state"]
+
+    lines = ["📡 Status (checked about every 5 minutes):", ""]
+
+    for username in monitored_usernames():
+
+        is_live = state["accounts"].get(username)
+
+        if is_live is True:
+
+            since = state["live_since"].get(username)
+
+            extra = ""
+
+            if since:
+                extra = (
+                    f" since {format_short(since)} "
+                    f"({format_duration(time.time() - since)})"
+                )
+
+            lines.append(f"🔴 @{username} is LIVE{extra}")
+
+        elif is_live is False:
+            lines.append(f"⚫ @{username} is offline")
+
+        else:
+            lines.append(f"❔ @{username}: not checked yet")
+
+    return "\n".join(lines), None
+
+
+def cmd_history(ctx):
+
+    try:
+        with open(HISTORY_FILE, newline="") as file:
+            rows = list(csv.DictReader(file))
+    except FileNotFoundError:
+        rows = []
+
+    if not rows:
+        return "No finished LIVEs recorded yet.", None
+
+    lines = [f"🗓 Last {min(5, len(rows))} LIVEs (newest first):", ""]
+
+    for row in rows[-5:][::-1]:
+
+        # start_local looks like "2026-11-18 21:06:15"; show "11-18 21:06"
+        lines.append(
+            f"@{row['username']}: "
+            f"{row['start_local'][5:16]} to {row['end_local'][5:16]} "
+            f"({row['duration']})"
+        )
+
+    return "\n".join(lines), None
+
+
+def cmd_followers(ctx):
+
+    count = len(ctx["subs"]["ids"])
+
+    return f"👥 Followers: {count} of {MAX_SUBSCRIBERS}", None
+
+
+def cmd_follow(ctx):
+
+    subs = ctx["subs"]
+    chat_id = ctx["chat_id"]
+
+    if ctx["is_owner"]:
+        return "You already get every alert, you own this bot. 🙂", None
+
+    if chat_id in subs["ids"]:
+        return "You are already following. Send /unfollow to stop.", None
+
+    if len(subs["ids"]) >= MAX_SUBSCRIBERS:
+        return "Sorry, the follower list is full.", None
+
+    subs["ids"].append(chat_id)
+    subs["dirty"] = True
+
+    return (
+        FOLLOW_TEXT,
+        f"👤 New follower. Followers: {len(subs['ids'])}"
+    )
+
+
+def cmd_unfollow(ctx):
+
+    subs = ctx["subs"]
+    chat_id = ctx["chat_id"]
+
+    if chat_id not in subs["ids"]:
+        return "You were not following.", None
+
+    subs["ids"].remove(chat_id)
+    subs["dirty"] = True
+
+    return (
+        "✅ You stopped following. Send /follow to return.",
+        f"👤 A follower left. Followers: {len(subs['ids'])}"
+    )
+
+
+# ------------------------------------------
+# THE COMMAND LIST. To add a command: write a
+# cmd_... function above and add one line here.
+# (name, description shown in Telegram's menu,
+#  owner_only, handler)
+# Names: lowercase letters, digits, underscore.
+# The bot copies this list into Telegram's menu
+# by itself, so BotFather is not needed.
+# ------------------------------------------
+
+COMMANDS = [
+    ("status",    "Who is LIVE right now",                False, cmd_status),
+    ("history",   "Last 5 finished LIVEs",                False, cmd_history),
+    ("follow",    "Get an alert when they go LIVE",       False, cmd_follow),
+    ("unfollow",  "Stop getting alerts",                  False, cmd_unfollow),
+    ("help",      "Show all commands",                    False, cmd_help),
+    ("followers", "How many people follow (owner only)",  True,  cmd_followers),
+]
+
+
+def sync_command_menu(state):
+
+    # Copies COMMANDS into Telegram's own command menu (the "/" list and the
+    # Menu button). Only runs when the list changed. Everyone sees the normal
+    # commands; the owner's chat also shows the owner-only ones.
+
+    everyone = [
+        (name, description)
+        for name, description, owner_only, _ in COMMANDS
+        if not owner_only
+    ]
+
+    owner = [
+        (name, description)
+        for name, description, _, _ in COMMANDS
+    ]
+
+    fingerprint = hashlib.sha256(
+        json.dumps([everyone, owner]).encode()
+    ).hexdigest()[:16]
+
+    if state.get("commands_hash") == fingerprint:
+        return
+
+    def set_commands(commands, scope=None):
+
+        data = {
+            "commands": json.dumps([
+                {"command": name, "description": description}
+                for name, description in commands
+            ])
+        }
+
+        if scope:
+            data["scope"] = json.dumps(scope)
+
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
+            data=data,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        if not response.json().get("ok"):
+            raise RuntimeError("Telegram setMyCommands returned an error")
+
+    set_commands(everyone)
+    set_commands(owner, {"type": "chat", "chat_id": int(CHAT_ID)})
+
+    state["commands_hash"] = fingerprint
+
+    print("Telegram command menu updated.")
+
+
 def process_commands(state, subs):
 
     response = requests.get(
@@ -268,6 +481,13 @@ def process_commands(state, subs):
     if not result.get("ok"):
         raise RuntimeError("Telegram getUpdates returned an error")
 
+    handlers = {
+        name: (owner_only, handler)
+        for name, _, owner_only, handler in COMMANDS
+    }
+
+    handlers["start"] = handlers["help"]
+
     handled = 0
 
     for update in result["result"]:
@@ -286,49 +506,27 @@ def process_commands(state, subs):
             continue
 
         chat_id = chat.get("id")
-        command = text.split()[0].split("@")[0].lower()
-        is_owner = str(chat_id) == str(CHAT_ID)
+        command = text.split()[0].split("@")[0].lstrip("/").lower()
 
-        reply = None
+        ctx = {
+            "chat_id": chat_id,
+            "is_owner": str(chat_id) == str(CHAT_ID),
+            "state": state,
+            "subs": subs,
+        }
+
         owner_note = None
 
-        if command in ("/start", "/help"):
-            reply = HELP_TEXT
+        entry = handlers.get(command)
 
-        elif command == "/follow":
+        if entry is None:
+            reply = "Unknown command. Send /help to see what I can do."
 
-            if is_owner:
-                reply = "You already get every alert, you own this bot. 🙂"
+        elif entry[0] and not ctx["is_owner"]:
+            reply = "That command is only for the owner of this bot."
 
-            elif chat_id in subs["ids"]:
-                reply = "You are already following. Send /unfollow to stop."
-
-            elif len(subs["ids"]) >= MAX_SUBSCRIBERS:
-                reply = "Sorry, the follower list is full."
-
-            else:
-                subs["ids"].append(chat_id)
-                subs["dirty"] = True
-                reply = FOLLOW_TEXT
-                owner_note = (
-                    f"👤 New follower. Followers: {len(subs['ids'])}"
-                )
-
-        elif command == "/unfollow":
-
-            if chat_id in subs["ids"]:
-                subs["ids"].remove(chat_id)
-                subs["dirty"] = True
-                reply = "✅ You stopped following. Send /follow to return."
-                owner_note = (
-                    f"👤 A follower left. Followers: {len(subs['ids'])}"
-                )
-
-            else:
-                reply = "You were not following."
-
-        if reply is None:
-            continue
+        else:
+            reply, owner_note = entry[1](ctx)
 
         handled += 1
 
@@ -401,7 +599,8 @@ def load_state():
             "live_since": {},
             "offline_checks": {},
             "offline_since": {},
-            "update_offset": 0
+            "update_offset": 0,
+            "commands_hash": ""
         }
 
     with open(STATE_FILE, "r") as file:
@@ -442,7 +641,9 @@ def load_state():
             if isinstance(value, (int, float))
         },
         # Next Telegram update to read (see process_commands)
-        "update_offset": int(data.get("update_offset", 0))
+        "update_offset": int(data.get("update_offset", 0)),
+        # Fingerprint of the command list last sent to Telegram's menu
+        "commands_hash": str(data.get("commands_hash", ""))
     }
 
 
@@ -458,14 +659,7 @@ def save_state(state):
 
 async def main():
 
-    usernames = [
-        USERNAME_1.strip().lstrip("@"),
-        USERNAME_2.strip().lstrip("@")
-    ]
-
-    usernames = list(dict.fromkeys(
-        username for username in usernames if username
-    ))
+    usernames = monitored_usernames()
 
     state = load_state()
     previous_status = state["accounts"]
@@ -498,6 +692,14 @@ async def main():
             subs["ids"] = load_subscribers(fernet)
             subs["ok"] = True
             print(f"Followers: {len(subs['ids'])}")
+
+            # Keep Telegram's command menu in sync with COMMANDS. A failure
+            # here must not stop the commands themselves from being read.
+            try:
+                sync_command_menu(state)
+            except Exception as error:
+                print(f"Command menu not updated: {describe(error)}")
+
             process_commands(state, subs)
 
         except Exception as error:
