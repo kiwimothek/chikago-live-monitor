@@ -1,21 +1,12 @@
 {
     "accounts": {
-        "user4525838653694": true,
-        "ventsislav.angelo06": true
+        "user4525838653694": false,
+        "ventsislav.angelo06": false
     },
-    "last_offline_heartbeat": 1795509636.9405932,
-    "live_since": {
-        "user4525838653694": 1795547264.7365696,
-        "ventsislav.angelo06": 1795547266.1141863
-    },
-    "offline_checks": {
-        "user4525838653694": 2,
-        "ventsislav.angelo06": 2
-    },
-    "offline_since": {
-        "user4525838653694": 1795552284.0519655,
-        "ventsislav.angelo06": 1795552284.9969542
-    },
+    "last_offline_heartbeat": 1795552847.718727,
+    "live_since": {},
+    "offline_checks": {},
+    "offline_since": {},
     "update_offset": 667622471,
     "commands_hash": "67dfa8d98c7df6d7"
 }
