@@ -40,7 +40,7 @@ SUBSCRIBERS_KEY = os.environ.get("SUBSCRIBERS_KEY", "").strip()
 
 # SETTINGS
 CHECK_INTERVAL = 5       # GitHub runs every 5 minutes
-HEARTBEAT_INTERVAL = 12 * 60 * 60  # 12 hours in seconds
+HEARTBEAT_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 
 # Runs start a little earlier or later than every 5 minutes, so a run that
 # is only a minute or two short of the interval still counts as "due".
@@ -882,7 +882,7 @@ async def main():
         message = (
             "🟢 TIKTOK BOT IS ALIVE\n\n"
             + "\n".join(status_lines)
-            + "\n\nNext heartbeat in approximately 12 hours."
+            + "\n\nNext heartbeat in approximately 7 days."
         )
 
         try:
