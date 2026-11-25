@@ -9,10 +9,12 @@
         "ventsislav.angelo06": 1795602882.2751164
     },
     "offline_checks": {
-        "ventsislav.angelo06": 1
+        "ventsislav.angelo06": 2,
+        "user4525838653694": 1
     },
     "offline_since": {
-        "ventsislav.angelo06": 1795603994.3457294
+        "ventsislav.angelo06": 1795603994.3457294,
+        "user4525838653694": 1795604267.8931496
     },
     "update_offset": 667622471,
     "commands_hash": "67dfa8d98c7df6d7"
