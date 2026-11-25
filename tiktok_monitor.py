@@ -47,12 +47,14 @@ HEARTBEAT_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 # Without this, a heartbeat can slip to the next run.
 HEARTBEAT_TOLERANCE = 2 * 60  # 2 minutes in seconds
 
-# A LIVE only counts as ended after the account looks offline on this many
-# checks in a row (about 4.7 minutes apart, so 3 checks is roughly 10
-# minutes). This stops a short TikTok glitch from splitting one live into
-# two. The recorded end time is the FIRST offline check, so the waiting
-# does not inflate the duration. Starts are announced immediately.
-OFFLINE_CONFIRM_CHECKS = 3
+# A LIVE counts as ended after the account looks offline on this many
+# checks in a row (about 4.7 minutes apart). With 1, a stop is announced on
+# the first offline check. A higher number (3 is roughly 10 minutes) stops a
+# short TikTok glitch from splitting one live into two, at the cost of a
+# later "stopped" alert. The recorded end time is always the FIRST offline
+# check, so any waiting does not inflate the duration. Starts are announced
+# immediately.
+OFFLINE_CONFIRM_CHECKS = 1
 
 # Followers who sent /follow (encrypted list of Telegram chat IDs)
 SUBSCRIBERS_FILE = Path("subscribers.enc")
