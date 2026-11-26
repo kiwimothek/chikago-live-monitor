@@ -1,10 +1,13 @@
 {
     "accounts": {
-        "user4525838653694": false,
-        "ventsislav.angelo06": false
+        "user4525838653694": true,
+        "ventsislav.angelo06": true
     },
     "last_offline_heartbeat": 1795595936.5698247,
-    "live_since": {},
+    "live_since": {
+        "user4525838653694": 1795720020.1595674,
+        "ventsislav.angelo06": 1795720021.2105222
+    },
     "offline_checks": {},
     "offline_since": {},
     "update_offset": 667622473,
