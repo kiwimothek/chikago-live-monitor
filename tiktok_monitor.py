@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import time
 import requests
 
@@ -152,20 +153,43 @@ def send_telegram(message, silent=False, chat_id=None):
 
 
 # ==========================================
-# FOLLOWERS (/follow, /unfollow)
+# FOLLOWERS (/follow, /unfollow, /schedule)
 # ==========================================
 #
 # Anyone can message the bot /follow. Their chat ID is read from Telegram
 # (getUpdates), stored ENCRYPTED in subscribers.enc, and from then on they
 # get the same LIVE / STOPPED alerts as the owner. The TikTok check still
-# happens only once per run. Chat IDs are never printed: the logs of a
-# public repository are public.
+# happens only once per run. A follower can also set a schedule with
+# /schedule (two times of day): outside it they are simply skipped, and the
+# schedule is saved in the same encrypted file. Chat IDs are never printed:
+# the logs of a public repository are public.
+
+HELP_TEXT = (
+    "👋 Welcome to Чикаго live bot! This bot monitors both official "
+    "accounts every 5 minutes and sends a notification the time it "
+    "detects them live!\n"
+    "🚨 To follow type /follow\n"
+    "⚙️ For more commands /commands"
+)
 
 FOLLOW_TEXT = (
-    "✅ You are now following. You will get an alert when a monitored "
-    "account goes LIVE or stops (checked about every 5 minutes).\n\n"
-    "Your chat ID is stored encrypted. Send /unfollow to stop."
+    "✅ Followed the bot! Do you want it to alert you only during a certain "
+    "time? If yes, then type /schedule to configure it!"
 )
+
+SCHEDULE_HELP = (
+    "⏰ Send me 2 times: when alerts should start and when they should "
+    "stop, for example:\n\n"
+    "20:00 23:30\n\n"
+    "You will only get alerts between those times (Bulgarian time). "
+    "Overnight works too, like 22:00 02:00.\n\n"
+    "/schedule off - get alerts at any time"
+)
+
+# Words allowed around the two times, so "from 20:00 to 23:30" and
+# "от 20:00 до 23:30" work. Anything else means it is not a schedule.
+TIME_PATTERN = re.compile(r"(?<!\d)(\d{1,2})[:.](\d{2})(?!\d)")
+SCHEDULE_WORDS = {"from", "to", "till", "until", "and", "от", "до", "и"}
 
 
 def make_fernet():
@@ -187,27 +211,140 @@ def make_fernet():
 
 def load_subscribers(fernet):
 
-    # Raises if the file cannot be read, so a wrong key can never lead
-    # to the real list being overwritten with an empty one.
+    # Returns (chat IDs, {chat ID: (from, to)}). Raises if the file cannot
+    # be read, so a wrong key can never lead to the real list being
+    # overwritten with an empty one.
 
     if not SUBSCRIBERS_FILE.exists():
-        return []
+        return [], {}
 
     try:
-        data = fernet.decrypt(SUBSCRIBERS_FILE.read_bytes())
-        return [int(chat_id) for chat_id in json.loads(data)]
+        data = json.loads(fernet.decrypt(SUBSCRIBERS_FILE.read_bytes()))
 
-    except (InvalidToken, ValueError, TypeError):
+        # Old format: just a list of chat IDs, no schedules yet
+        if isinstance(data, list):
+            return [int(chat_id) for chat_id in data], {}
+
+        ids = [int(chat_id) for chat_id in data.get("ids", [])]
+
+        schedules = {}
+
+        for key, value in data.get("schedules", {}).items():
+
+            if int(key) in ids and len(value) == 2:
+                schedules[int(key)] = (str(value[0]), str(value[1]))
+
+        return ids, schedules
+
+    except (
+        InvalidToken, ValueError, TypeError,
+        KeyError, IndexError, AttributeError
+    ):
         raise RuntimeError(
             "could not decrypt subscribers.enc (wrong SUBSCRIBERS_KEY?)"
         ) from None
 
 
-def save_subscribers(fernet, chat_ids):
+def save_subscribers(fernet, chat_ids, schedules):
+
+    data = {
+        "ids": sorted(chat_ids),
+        "schedules": {
+            str(chat_id): list(window)
+            for chat_id, window in schedules.items()
+            if chat_id in chat_ids
+        }
+    }
 
     SUBSCRIBERS_FILE.write_bytes(
-        fernet.encrypt(json.dumps(sorted(chat_ids)).encode())
+        fernet.encrypt(json.dumps(data).encode())
     )
+
+
+def remove_subscriber(subs, chat_id):
+
+    if chat_id in subs["ids"]:
+        subs["ids"].remove(chat_id)
+
+    subs["schedules"].pop(chat_id, None)
+    subs["dirty"] = True
+
+
+# ------------------------------------------
+# Schedules: "only alert me between A and B"
+# ------------------------------------------
+
+def find_times(text):
+
+    # Does this text LOOK like a schedule: two times with nothing else but
+    # separators or words like "from" / "to" / "от" / "до"? Returns the raw
+    # (hour, minute) pairs, or None. It does not check the values.
+
+    matches = TIME_PATTERN.findall(text)
+
+    if len(matches) != 2:
+        return None
+
+    leftover = TIME_PATTERN.sub(" ", text)
+
+    for word in re.findall(r"[^\W\d_]+", leftover):
+        if word.lower() not in SCHEDULE_WORDS:
+            return None
+
+    return matches
+
+
+def parse_times(text):
+
+    # "20:00 23:30", "20:00-23:30", "from 8:00 to 10:15", "от 20:00 до 23:30"
+    # Returns ("20:00", "23:30"), or None if the text is not two valid times.
+
+    matches = find_times(text)
+
+    if matches is None:
+        return None
+
+    times = []
+
+    for hour, minute in matches:
+
+        hour, minute = int(hour), int(minute)
+
+        if hour > 23 or minute > 59:
+            return None
+
+        times.append(f"{hour:02d}:{minute:02d}")
+
+    return tuple(times)
+
+
+def to_minutes(value):
+
+    hour, minute = value.split(":")
+
+    return int(hour) * 60 + int(minute)
+
+
+def in_schedule(window):
+
+    # No schedule means "always". Times are Bulgarian (Sofia) time, and a
+    # window like 22:00 to 02:00 runs past midnight. Both ends are included.
+
+    if not window:
+        return True
+
+    start, end = to_minutes(window[0]), to_minutes(window[1])
+
+    if start == end:
+        return True
+
+    now = datetime.fromtimestamp(time.time(), LOCAL_TZ)
+    minutes = now.hour * 60 + now.minute
+
+    if start < end:
+        return start <= minutes <= end
+
+    return minutes >= start or minutes <= end
 
 
 def broadcast(message, subs):
@@ -218,8 +355,14 @@ def broadcast(message, subs):
 
     sent = 0
     failed = 0
+    skipped = 0
 
     for chat_id in list(subs["ids"]):
+
+        # Outside the follower's schedule: they simply do not get this one
+        if not in_schedule(subs["schedules"].get(chat_id)):
+            skipped += 1
+            continue
 
         try:
             send_telegram(message, chat_id=chat_id)
@@ -233,14 +376,16 @@ def broadcast(message, subs):
                 error.response is not None
                 and error.response.status_code == 403
             ):
-                subs["ids"].remove(chat_id)
-                subs["dirty"] = True
+                remove_subscriber(subs, chat_id)
 
         except Exception:
             failed += 1
 
-    if sent or failed:
-        print(f"Followers notified: {sent}, failed: {failed}")
+    if sent or failed or skipped:
+        print(
+            f"Followers notified: {sent}, failed: {failed}, "
+            f"outside their schedule: {skipped}"
+        )
 
 
 # ------------------------------------------
@@ -265,12 +410,12 @@ def monitored_usernames():
 
 def cmd_help(ctx):
 
-    lines = [
-        "👋 This bot sends an alert when the monitored TikTok accounts "
-        "go LIVE or stop being LIVE.",
-        "",
-        "Commands:",
-    ]
+    return HELP_TEXT, None
+
+
+def cmd_commands(ctx):
+
+    lines = ["⚙️ Commands:", ""]
 
     for name, description, owner_only, _ in COMMANDS:
 
@@ -344,9 +489,13 @@ def cmd_history(ctx):
 
 def cmd_followers(ctx):
 
-    count = len(ctx["subs"]["ids"])
+    subs = ctx["subs"]
 
-    return f"👥 Followers: {count} of {MAX_SUBSCRIBERS}", None
+    return (
+        f"👥 Followers: {len(subs['ids'])} of {MAX_SUBSCRIBERS} "
+        f"({len(subs['schedules'])} with a schedule)",
+        None
+    )
 
 
 def cmd_follow(ctx):
@@ -380,12 +529,68 @@ def cmd_unfollow(ctx):
     if chat_id not in subs["ids"]:
         return "You were not following.", None
 
-    subs["ids"].remove(chat_id)
-    subs["dirty"] = True
+    remove_subscriber(subs, chat_id)
 
     return (
         "✅ You stopped following. Send /follow to return.",
         f"👤 A follower left. Followers: {len(subs['ids'])}"
+    )
+
+
+def cmd_schedule(ctx):
+
+    # /schedule            -> shows the current schedule and how to set one
+    # /schedule 20:00 23:30 -> sets it (a plain "20:00 23:30" message works too)
+    # /schedule off        -> removes it
+
+    subs = ctx["subs"]
+    chat_id = ctx["chat_id"]
+    args = ctx["args"]
+
+    if ctx["is_owner"]:
+        return "You are the owner, so you always get every alert.", None
+
+    if chat_id not in subs["ids"]:
+        return "Follow the bot first with /follow, then set a schedule.", None
+
+    current = subs["schedules"].get(chat_id)
+
+    if args and args[0].lower() in ("off", "clear", "reset", "all", "always"):
+
+        if current:
+            subs["schedules"].pop(chat_id, None)
+            subs["dirty"] = True
+
+        return "✅ Schedule removed. You will get alerts at any time.", None
+
+    if not args:
+
+        intro = ""
+
+        if current:
+            intro = (
+                f"Your schedule: {current[0]} to {current[1]} "
+                f"(Bulgarian time).\n\n"
+            )
+
+        return intro + SCHEDULE_HELP, None
+
+    times = parse_times(" ".join(args))
+
+    if times is None:
+        return "I could not read those times. 🤔\n\n" + SCHEDULE_HELP, None
+
+    if times[0] == times[1]:
+        return "The two times must be different.\n\n" + SCHEDULE_HELP, None
+
+    subs["schedules"][chat_id] = times
+    subs["dirty"] = True
+
+    return (
+        f"✅ Schedule saved! You will get alerts only between "
+        f"{times[0]} and {times[1]} (Bulgarian time).\n\n"
+        f"Send /schedule off to get alerts at any time.",
+        None
     )
 
 
@@ -404,7 +609,9 @@ COMMANDS = [
     ("history",   "Last 5 finished LIVEs",                False, cmd_history),
     ("follow",    "Get an alert when they go LIVE",       False, cmd_follow),
     ("unfollow",  "Stop getting alerts",                  False, cmd_unfollow),
-    ("help",      "Show all commands",                    False, cmd_help),
+    ("schedule",  "Only get alerts at certain hours",     False, cmd_schedule),
+    ("commands",  "Show all commands",                    False, cmd_commands),
+    ("help",      "About this bot",                       False, cmd_help),
     ("followers", "How many people follow (owner only)",  True,  cmd_followers),
 ]
 
@@ -503,18 +710,33 @@ def process_commands(state, subs):
         chat = message.get("chat") or {}
         text = (message.get("text") or "").strip()
 
-        # Private chats only, and only /commands
-        if chat.get("type") != "private" or not text.startswith("/"):
+        # Private chats only
+        if chat.get("type") != "private" or not text:
+            continue
+
+        if text.startswith("/"):
+            parts = text.split()
+            command = parts[0].split("@")[0].lstrip("/").lower()
+            args = parts[1:]
+
+        elif find_times(text):
+            # Someone replying with just two times (like "20:00 23:30")
+            # after /schedule: treat it as /schedule 20:00 23:30. Times with
+            # an impossible value (like 25:00) get the "could not read" reply.
+            command = "schedule"
+            args = text.split()
+
+        else:
             continue
 
         chat_id = chat.get("id")
-        command = text.split()[0].split("@")[0].lstrip("/").lower()
 
         ctx = {
             "chat_id": chat_id,
             "is_owner": str(chat_id) == str(CHAT_ID),
             "state": state,
             "subs": subs,
+            "args": args,
         }
 
         owner_note = None
@@ -522,7 +744,7 @@ def process_commands(state, subs):
         entry = handlers.get(command)
 
         if entry is None:
-            reply = "Unknown command. Send /help to see what I can do."
+            reply = "Unknown command. Send /commands to see what I can do."
 
         elif entry[0] and not ctx["is_owner"]:
             reply = "That command is only for the owner of this bot."
@@ -685,13 +907,13 @@ async def main():
     # follower can already get an alert from this very run.
     fernet = make_fernet()
 
-    subs = {"ids": [], "dirty": False, "ok": False}
+    subs = {"ids": [], "schedules": {}, "dirty": False, "ok": False}
 
     if fernet is None:
         print("Followers off (no SUBSCRIBERS_KEY): alerts go to the owner only.")
     else:
         try:
-            subs["ids"] = load_subscribers(fernet)
+            subs["ids"], subs["schedules"] = load_subscribers(fernet)
             subs["ok"] = True
             print(f"Followers: {len(subs['ids'])}")
 
@@ -912,7 +1134,7 @@ async def main():
     # was read correctly), so the public repo shows no needless changes.
     if fernet is not None and subs["ok"] and subs["dirty"]:
         try:
-            save_subscribers(fernet, subs["ids"])
+            save_subscribers(fernet, subs["ids"], subs["schedules"])
             print("Follower list updated.")
         except Exception as error:
             print(f"Could not save followers: {error}")
